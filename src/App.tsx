@@ -85,7 +85,7 @@ const PROGRAM = {
       { name: "Comp Bench", w: 80, sets: 3, reps: 2, lift: "bench", main: true, cue: "WIDE grip, full comp setup, self-commands. Film from foot end." },
       { name: "Paused Back-off", w: 72.5, sets: 2, reps: 4, lift: "bench", cue: "Quality volume at comp grip." },
       { name: "Walkout Hold", w: 120, sets: 2, reps: 1, cue: "10s. Own the weight before you squat." },
-      { name: "Squat (moderate)", w: 85, sets: 3, reps: 5, lift: "squat", cue: "Second weekly tendon exposure. Crisp technique, RPE 6-7 max." },
+      { name: "Squat (moderate)", w: 85, sets: 3, reps: 5, lift: "squat", rpe: 6.5, cue: "Second weekly tendon exposure. Crisp technique, RPE 6-7 max." },
       { name: "Cable External Rotation", w: 7.5, sets: 3, reps: 15, cue: "Left shoulder priority." },
     ],
   },
@@ -133,6 +133,57 @@ function bestE1rmForLift(sessions, lift) {
     })
   );
   return best;
+}
+
+// Auto-regulation: suggest today's weight/reps from the last logged
+// performance of this exercise, honouring the athlete's progression rules.
+function suggestForExercise(planEx, sessions) {
+  const fallback = { w: planEx.w, reps: planEx.reps, note: null };
+  if (!planEx.w) return fallback; // bodyweight/timed work doesn't auto-adjust
+  const sorted = [...sessions].sort((a, b) => b.date.localeCompare(a.date));
+  for (const s of sorted) {
+    const ex = s.exercises.find((e) => e.name === planEx.name && !e.skipped);
+    if (!ex) continue;
+    const work = ex.sets.filter((st) => st.w > 0 && st.r > 0);
+    if (!work.length) continue;
+
+    const lastW = Math.max(...work.map((st) => st.w));
+    const rpes = work.map((st) => st.rpe || 0).filter((r) => r > 0);
+    const avgRpe = rpes.length ? rpes.reduce((a, b) => a + b, 0) / rpes.length : null;
+    const maxPain = Math.max(...work.map((st) => st.pain || 0));
+    const target = planEx.rpe || 8;
+    const inc = planEx.lift === "deadlift" ? 5 : 2.5;
+    const isAccessory = !planEx.lift;
+
+    // pain gate beats everything
+    if (maxPain >= 4) {
+      const w = Math.max(0, Math.round((lastW * 0.9) / 2.5) * 2.5);
+      return { w, reps: planEx.reps, note: `↓ to ${w}kg — pain hit ${maxPain}/10 last time. Rebuild from here.` };
+    }
+
+    // DOH gate: never progresses unless every rep held
+    if (planEx.doh && !work.every((st) => st.doh)) {
+      return { w: lastW, reps: planEx.reps, note: `holding ${lastW}kg — grip broke last session. Every rep holds before this moves.` };
+    }
+
+    if (avgRpe === null) return { w: lastW, reps: planEx.reps, note: `holding ${lastW}kg — log RPE and this starts auto-adjusting.` };
+
+    if (avgRpe <= target - 0.5) {
+      if (isAccessory) {
+        const lastR = Math.max(...work.map((st) => st.r));
+        if (lastR < planEx.reps + 3)
+          return { w: lastW, reps: lastR + 1, note: `↑ +1 rep (RPE ${avgRpe.toFixed(1)} last time — reps before weight).` };
+        return { w: lastW + 2.5, reps: planEx.reps, note: `↑ +2.5kg, reps reset — rep range maxed out.` };
+      }
+      return { w: lastW + inc, reps: planEx.reps, note: `↑ +${inc}kg — averaged RPE ${avgRpe.toFixed(1)} vs target ${target} last session.` };
+    }
+    if (avgRpe >= target + 1) {
+      const w = Math.max(0, lastW - inc);
+      return { w, reps: planEx.reps, note: `↓ −${inc}kg — RPE ${avgRpe.toFixed(1)} ran over target ${target}. Own it, then it comes back up.` };
+    }
+    return { w: lastW, reps: planEx.reps, note: `holding ${lastW}kg — RPE ${avgRpe.toFixed(1)}, right at target.` };
+  }
+  return fallback;
 }
 
 function platesPerSide(total) {
@@ -593,11 +644,15 @@ function DaySession({ dayKey, data, save }) {
 
   const blank = () => ({
     id: Date.now(), date: todayStr(), dayKey,
-    exercises: plan.exercises.map((ex) => ({
-      name: ex.name, lift: ex.lift || null, main: !!ex.main, targetW: ex.w, dohFlag: !!ex.doh, skipped: false,
-      sets: Array.from({ length: ex.sets }, () => ({ w: ex.w, r: ex.reps, rpe: "", pain: 0, doh: !!ex.doh })),
-      notes: "",
-    })),
+    exercises: plan.exercises.map((ex) => {
+      const sug = suggestForExercise(ex, data.sessions);
+      return {
+        name: ex.name, lift: ex.lift || null, main: !!ex.main, targetW: sug.w, dohFlag: !!ex.doh, skipped: false,
+        autoNote: sug.note,
+        sets: Array.from({ length: ex.sets }, () => ({ w: sug.w, r: sug.reps, rpe: "", pain: 0, doh: !!ex.doh })),
+        notes: "",
+      };
+    }),
   });
 
   const [session, setSession] = useState(existing || blank());
@@ -678,8 +733,15 @@ function DaySession({ dayKey, data, save }) {
           </div>
           <div className="rowBetween">
             {ex.main && <span className="mainTag">tracks {ex.lift}</span>}
-            <div className="exTarget">{planEx.sets}×{planEx.reps} @ {ex.targetW || "—"}kg</div>
+            <div className="exBtnGroup">
+              <a className="miniBtn" style={{ textDecoration: "none" }} target="_blank" rel="noopener noreferrer"
+                href={"https://www.youtube.com/results?search_query=" + encodeURIComponent(ex.name + " exercise form")}>
+                ▶ demo
+              </a>
+              <div className="exTarget" style={{ alignSelf: "center" }}>{planEx.sets}×{planEx.reps} @ {ex.targetW || "—"}kg · RPE {planEx.rpe || 8}</div>
+            </div>
           </div>
+          {!ex.skipped && ex.autoNote && <div className="autoNote">auto: {ex.autoNote}</div>}
           {!ex.skipped && planEx.cue && <div className="cue">{planEx.cue}</div>}
 
           {ex.skipped ? (
@@ -694,10 +756,13 @@ function DaySession({ dayKey, data, save }) {
                   <span className="setNum">{setI + 1}</span>
                   <input className="setInput" type="number" inputMode="decimal" value={st.w}
                     onChange={(e) => update(exI, setI, "w", e.target.value)} />
-                  <input className="setInput" type="number" inputMode="numeric" value={st.r}
-                    onChange={(e) => update(exI, setI, "r", e.target.value)} />
-                  <input className="setInput" type="number" inputMode="decimal" placeholder="—" value={st.rpe}
-                    onChange={(e) => update(exI, setI, "rpe", e.target.value)} />
+                  <select className="setInput" value={st.r} onChange={(e) => update(exI, setI, "r", e.target.value)}>
+                    {Array.from({ length: 31 }, (_, i) => i).map((r) => <option key={r} value={r}>{r}</option>)}
+                  </select>
+                  <select className="setInput" value={st.rpe} onChange={(e) => update(exI, setI, "rpe", e.target.value)}>
+                    <option value="">—</option>
+                    {[5, 5.5, 6, 6.5, 7, 7.5, 8, 8.5, 9, 9.5, 10].map((r) => <option key={r} value={r}>{r}</option>)}
+                  </select>
                   <select className="setInput" value={st.pain} onChange={(e) => update(exI, setI, "pain", e.target.value)}>
                     {[0, 1, 2, 3, 4, 5, 6, 7, 8].map((p) => <option key={p} value={p}>{p}</option>)}
                   </select>
@@ -726,8 +791,31 @@ function DaySession({ dayKey, data, save }) {
 
       {analysis && (
         <div className="card" style={{ marginTop: 12 }}>
-          <div className="eyebrow" style={{ marginBottom: 10 }}>Session analysis</div>
-          {analysis.map((n, i) => <CoachNote key={i} n={n} />)}
+          <div className="eyebrow" style={{ marginBottom: 10 }}>Session debrief</div>
+          {analysis.greens.length > 0 && (
+            <>
+              <div className="flagHead" style={{ color: "#3DA35D" }}>Green flags</div>
+              {analysis.greens.map((t, i) => (
+                <div className="note" key={"g" + i}><span className="noteDot" style={{ background: "#3DA35D" }} /><span>{t}</span></div>
+              ))}
+            </>
+          )}
+          {analysis.reds.length > 0 && (
+            <>
+              <div className="flagHead" style={{ color: "#E23D3D" }}>Red flags</div>
+              {analysis.reds.map((t, i) => (
+                <div className="note" key={"r" + i}><span className="noteDot" style={{ background: "#E23D3D" }} /><span>{t}</span></div>
+              ))}
+            </>
+          )}
+          {analysis.infos.length > 0 && (
+            <>
+              <div className="flagHead" style={{ color: "#6E6E78" }}>Notes</div>
+              {analysis.infos.map((t, i) => (
+                <div className="note" key={"i" + i}><span className="noteDot" style={{ background: "#6E6E78" }} /><span>{t}</span></div>
+              ))}
+            </>
+          )}
         </div>
       )}
 
@@ -756,23 +844,73 @@ function DaySession({ dayKey, data, save }) {
 }
 
 function analyseSession(session, data) {
-  const out = [];
-  let tonnage = 0;
-  session.exercises.forEach((ex) => ex.sets.forEach((s) => (tonnage += (s.w || 0) * (s.r || 0))));
-  out.push({ level: "info", text: `Session tonnage: ${Math.round(tonnage).toLocaleString()}kg.` });
+  const greens = [], reds = [], infos = [];
+  const active = session.exercises.filter((ex) => !ex.skipped);
 
-  session.exercises.forEach((ex) => {
-    if (!ex.main || !ex.lift) return;
-    let best = 0;
-    ex.sets.forEach((s) => (best = Math.max(best, e1rm(s.w, s.r, s.rpe))));
-    if (!best) return;
-    const prevBest = bestE1rmForLift(data.sessions.filter((s) => s.id !== session.id), ex.lift) || BASELINE[ex.lift];
-    if (best > prevBest) out.push({ level: "go", text: `${ex.name}: new best e1RM ${best}kg (was ${prevBest}kg). That's a PR signal.` });
-    else out.push({ level: "info", text: `${ex.name}: e1RM ${best}kg today vs best ${prevBest}kg.` });
-    const pains = ex.sets.map((s) => s.pain || 0);
-    if (Math.max(...pains) >= 4) out.push({ level: "warn", text: `${ex.name}: pain hit ${Math.max(...pains)}/10 — flag this for the physio and drop load 10% next session if it repeats.` });
+  // tonnage + comparison vs last same-type session
+  let tonnage = 0;
+  active.forEach((ex) => ex.sets.forEach((s) => (tonnage += (s.w || 0) * (s.r || 0))));
+  const prevSame = data.sessions
+    .filter((s) => s.dayKey === session.dayKey && s.id !== session.id)
+    .sort((a, b) => b.date.localeCompare(a.date))[0];
+  if (prevSame) {
+    let prevT = 0;
+    prevSame.exercises.filter((e) => !e.skipped).forEach((ex) => ex.sets.forEach((s) => (prevT += (s.w || 0) * (s.r || 0))));
+    if (prevT > 0) {
+      const pct = Math.round(((tonnage - prevT) / prevT) * 100);
+      infos.push(`Tonnage: ${Math.round(tonnage).toLocaleString()}kg (${pct >= 0 ? "+" : ""}${pct}% vs last ${session.dayKey.toUpperCase()} session).`);
+    } else infos.push(`Tonnage: ${Math.round(tonnage).toLocaleString()}kg.`);
+  } else {
+    infos.push(`Tonnage: ${Math.round(tonnage).toLocaleString()}kg — first logged session of this type, this is your baseline.`);
+  }
+
+  // completion
+  const skippedCount = session.exercises.length - active.length;
+  if (skippedCount === 0) greens.push("Full session completed — every exercise done.");
+  else infos.push(`${skippedCount} exercise${skippedCount > 1 ? "s" : ""} skipped this session.`);
+
+  // per-exercise checks
+  let sessionMaxPain = 0;
+  active.forEach((ex) => {
+    const workSets = ex.sets.filter((s) => s.w > 0 && s.r > 0);
+    if (!workSets.length) return;
+    const rpes = workSets.map((s) => s.rpe || 0).filter((r) => r > 0);
+    const avgRpe = rpes.length ? rpes.reduce((a, b) => a + b, 0) / rpes.length : null;
+    const maxPain = Math.max(...workSets.map((s) => s.pain || 0));
+    sessionMaxPain = Math.max(sessionMaxPain, maxPain);
+
+    // e1RM check for main lifts
+    if (ex.main && ex.lift) {
+      let best = 0;
+      workSets.forEach((s) => (best = Math.max(best, e1rm(s.w, s.r, s.rpe))));
+      if (best) {
+        const prevBest = bestE1rmForLift(data.sessions.filter((s) => s.id !== session.id), ex.lift) || BASELINE[ex.lift];
+        if (best > prevBest) greens.push(`${ex.name}: new best e1RM ${best}kg (was ${prevBest}kg) — PR signal.`);
+        else infos.push(`${ex.name}: e1RM ${best}kg today (best: ${prevBest}kg).`);
+      }
+    }
+
+    // RPE reading
+    if (avgRpe !== null) {
+      if (avgRpe <= 7.5 && ex.main) greens.push(`${ex.name}: averaged RPE ${avgRpe.toFixed(1)} — under target. Progression rule is close to being met.`);
+      if (avgRpe >= 9.3) reds.push(`${ex.name}: averaged RPE ${avgRpe.toFixed(1)} — too close to failure. Main lifts should never live there; pull the weight back next time.`);
+    }
+
+    // pain
+    if (maxPain >= 4) reds.push(`${ex.name}: pain hit ${maxPain}/10 — flag for physio, drop load 10% next session if it repeats.`);
+    else if (maxPain === 3) infos.push(`${ex.name}: pain touched 3/10 — watch it, that's your working ceiling.`);
+
+    // DOH
+    if (ex.dohFlag) {
+      const allDoh = workSets.every((s) => s.doh);
+      if (allDoh) greens.push(`${ex.name}: every set held double overhand — grip is building.`);
+      else reds.push(`${ex.name}: grip broke on at least one set — hold the weight until every rep holds.`);
+    }
   });
-  return out;
+
+  if (sessionMaxPain === 0 && active.length > 0) greens.push("Zero pain across the entire session.");
+
+  return { greens, reds, infos };
 }
 
 function RestTimer() {
@@ -801,15 +939,16 @@ function RestTimer() {
 
 function Progress({ data }) {
   const sessions = [...data.sessions].sort((a, b) => a.date.localeCompare(b.date));
+  const [view, setView] = useState("squat");
 
-  const liftSeries = (lift) =>
+  const liftPoints = (lift) =>
     sessions
       .map((s) => {
         let best = 0;
         s.exercises.forEach((ex) => {
-          if (ex.lift === lift && ex.main) ex.sets.forEach((st) => (best = Math.max(best, e1rm(st.w, st.r, st.rpe))));
+          if (ex.lift === lift && ex.main && !ex.skipped) ex.sets.forEach((st) => (best = Math.max(best, e1rm(st.w, st.r, st.rpe))));
         });
-        return best ? { date: fmtShort(s.date), v: best } : null;
+        return best ? { date: s.date, label: fmtShort(s.date), v: best } : null;
       })
       .filter(Boolean);
 
@@ -820,75 +959,124 @@ function Progress({ data }) {
       const monday = new Date(d); monday.setDate(d.getDate() - ((d.getDay() + 6) % 7));
       const k = monday.toISOString().slice(0, 10);
       let t = 0;
-      s.exercises.forEach((ex) => ex.sets.forEach((st) => (t += (st.w || 0) * (st.r || 0))));
+      s.exercises.filter((e) => !e.skipped).forEach((ex) => ex.sets.forEach((st) => (t += (st.w || 0) * (st.r || 0))));
       map[k] = (map[k] || 0) + t;
     });
-    return Object.entries(map).sort().map(([k, v]) => ({ date: fmtShort(k), v: Math.round(v) }));
+    return Object.entries(map).sort().map(([k, v]) => ({ label: fmtShort(k), v: Math.round(v) }));
   }, [sessions]);
 
-  const bwSeries = data.bodyweight.map((b) => ({ date: fmtShort(b.date), v: b.kg }));
+  const rpeSeries = sessions
+    .map((s) => {
+      const rpes = s.exercises.filter((e) => !e.skipped).flatMap((ex) => ex.sets.map((st) => st.rpe || 0)).filter((r) => r > 0);
+      return rpes.length ? { label: fmtShort(s.date), v: Math.round((rpes.reduce((a, b) => a + b, 0) / rpes.length) * 10) / 10 } : null;
+    })
+    .filter(Boolean);
+
+  const painSeries = sessions
+    .map((s) => {
+      const pains = s.exercises.filter((e) => !e.skipped).flatMap((ex) => ex.sets.map((st) => st.pain || 0));
+      return pains.length ? { label: fmtShort(s.date), v: Math.max(...pains) } : null;
+    })
+    .filter(Boolean);
+
+  const bwSeries = data.bodyweight.map((b) => ({ label: fmtShort(b.date), v: b.kg }));
+
+  // simple linear projection: days until e1RM trend line crosses target
+  const projection = (lift) => {
+    const pts = liftPoints(lift);
+    if (pts.length < 3) return null;
+    const xs = pts.map((p) => new Date(p.date + "T00:00").getTime() / 86400000);
+    const ys = pts.map((p) => p.v);
+    const n = xs.length;
+    const mx = xs.reduce((a, b) => a + b, 0) / n, my = ys.reduce((a, b) => a + b, 0) / n;
+    let num = 0, den = 0;
+    for (let i = 0; i < n; i++) { num += (xs[i] - mx) * (ys[i] - my); den += (xs[i] - mx) ** 2; }
+    if (den === 0) return null;
+    const slope = num / den; // kg per day
+    if (slope <= 0.005) return { flat: true };
+    const current = Math.max(...ys);
+    const daysToTarget = (TARGETS[lift] - current) / slope;
+    const when = new Date(Date.now() + daysToTarget * 86400000);
+    return { flat: false, date: when, perWeek: slope * 7 };
+  };
+
+  const CHARTS = {
+    squat: { title: "Squat e1RM", data: liftPoints("squat").map((p) => ({ label: p.label, v: p.v })), color: "#E23D3D", ref: TARGETS.squat, type: "line" },
+    bench: { title: "Bench e1RM", data: liftPoints("bench").map((p) => ({ label: p.label, v: p.v })), color: "#2E6FE0", ref: TARGETS.bench, type: "line" },
+    deadlift: { title: "Deadlift e1RM", data: liftPoints("deadlift").map((p) => ({ label: p.label, v: p.v })), color: "#E8B93B", ref: TARGETS.deadlift, type: "line" },
+    tonnage: { title: "Weekly tonnage (kg)", data: tonnageByWeek, color: "#3DA35D", type: "bar" },
+    rpe: { title: "Average session RPE", data: rpeSeries, color: "#B57EDC", ref: 8, refLabel: "target ceiling", type: "line", domain: [5, 10] },
+    pain: { title: "Max pain per session", data: painSeries, color: "#E86A3D", ref: 3, type: "line", domain: [0, 8] },
+    bodyweight: { title: "Bodyweight (kg)", data: bwSeries, color: "#EDECE8", ref: 93, type: "line", domain: [85, "auto"] },
+  };
+  const chart = CHARTS[view];
+
+  // best current per lift for target bars
+  const bests = {
+    squat: Math.max(BASELINE.squat, bestE1rmForLift(sessions, "squat")),
+    bench: Math.max(BASELINE.bench, bestE1rmForLift(sessions, "bench")),
+    deadlift: Math.max(BASELINE.deadlift, bestE1rmForLift(sessions, "deadlift")),
+  };
 
   return (
     <div>
-      {[
-        ["squat", TARGETS.squat, "#E23D3D"],
-        ["bench", TARGETS.bench, "#2E6FE0"],
-        ["deadlift", TARGETS.deadlift, "#E8B93B"],
-      ].map(([lift, target, color]) => {
-        const series = liftSeries(lift);
-        return (
-          <div className="card" key={lift}>
-            <div className="rowBetween">
-              <div className="eyebrow">{lift} e1RM</div>
-              <div className="eyebrow">target {target}kg</div>
-            </div>
-            {series.length ? (
-              <ResponsiveContainer width="100%" height={160}>
-                <LineChart data={series} margin={{ top: 8, right: 8, left: -18, bottom: 0 }}>
-                  <CartesianGrid stroke="#26262C" strokeDasharray="3 3" />
-                  <XAxis dataKey="date" tick={{ fill: "#6E6E78", fontSize: 10 }} />
-                  <YAxis tick={{ fill: "#6E6E78", fontSize: 10 }} domain={["auto", "auto"]} />
-                  <Tooltip contentStyle={{ background: "#1A1A1F", border: "1px solid #26262C", borderRadius: 8, color: "#EDECE8" }} />
-                  <ReferenceLine y={target} stroke={color} strokeDasharray="4 4" />
-                  <Line type="monotone" dataKey="v" stroke={color} strokeWidth={2} dot={{ r: 3, fill: color }} />
-                </LineChart>
-              </ResponsiveContainer>
-            ) : (
-              <div className="empty">Log a {lift} main-lift session and this chart comes alive.</div>
-            )}
-          </div>
-        );
-      })}
-
       <div className="card">
-        <div className="eyebrow">Weekly tonnage</div>
-        {tonnageByWeek.length ? (
-          <ResponsiveContainer width="100%" height={150}>
-            <BarChart data={tonnageByWeek} margin={{ top: 8, right: 8, left: -14, bottom: 0 }}>
-              <CartesianGrid stroke="#26262C" strokeDasharray="3 3" />
-              <XAxis dataKey="date" tick={{ fill: "#6E6E78", fontSize: 10 }} />
-              <YAxis tick={{ fill: "#6E6E78", fontSize: 10 }} />
-              <Tooltip contentStyle={{ background: "#1A1A1F", border: "1px solid #26262C", borderRadius: 8, color: "#EDECE8" }} />
-              <Bar dataKey="v" fill="#3DA35D" radius={[4, 4, 0, 0]} />
-            </BarChart>
-          </ResponsiveContainer>
-        ) : (
-          <div className="empty">Tonnage appears once sessions are logged.</div>
-        )}
+        <div className="eyebrow" style={{ marginBottom: 10 }}>Progress to BUCS targets</div>
+        {["squat", "bench", "deadlift"].map((lift) => {
+          const pct = Math.min(100, Math.round((bests[lift] / TARGETS[lift]) * 100));
+          const proj = projection(lift);
+          return (
+            <div key={lift} style={{ marginBottom: 12 }}>
+              <div className="rowBetween" style={{ marginBottom: 4 }}>
+                <span className="liftName">{lift}</span>
+                <span className="liftNums">{Math.round(bests[lift])} / {TARGETS[lift]}kg · {pct}%</span>
+              </div>
+              <div className="progTrack"><div className="progFill" style={{ width: pct + "%", background: CHARTS[lift].color }} /></div>
+              <div className="projText">
+                {proj === null && "Log 3+ sessions of this lift for a trend projection."}
+                {proj && proj.flat && "Trend is flat — no projection until it moves."}
+                {proj && !proj.flat && `Trending +${proj.perWeek.toFixed(1)}kg/week → target ~${proj.date.toLocaleDateString("en-GB", { month: "short", year: "numeric" })} at this rate.`}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="chartTabs">
+        {Object.entries({ squat: "SQ", bench: "BP", deadlift: "DL", tonnage: "VOL", rpe: "RPE", pain: "PAIN", bodyweight: "BW" }).map(([k, label]) => (
+          <button key={k} className={"chartTab" + (view === k ? " active" : "")} onClick={() => setView(k)}>{label}</button>
+        ))}
       </div>
 
       <div className="card">
-        <div className="eyebrow">Bodyweight — cutting to 93kg</div>
-        <ResponsiveContainer width="100%" height={150}>
-          <LineChart data={bwSeries} margin={{ top: 8, right: 8, left: -18, bottom: 0 }}>
-            <CartesianGrid stroke="#26262C" strokeDasharray="3 3" />
-            <XAxis dataKey="date" tick={{ fill: "#6E6E78", fontSize: 10 }} />
-            <YAxis tick={{ fill: "#6E6E78", fontSize: 10 }} domain={[85, "auto"]} />
-            <Tooltip contentStyle={{ background: "#1A1A1F", border: "1px solid #26262C", borderRadius: 8, color: "#EDECE8" }} />
-            <ReferenceLine y={93} stroke="#3DA35D" strokeDasharray="4 4" />
-            <Line type="monotone" dataKey="v" stroke="#EDECE8" strokeWidth={2} dot={{ r: 3, fill: "#EDECE8" }} />
-          </LineChart>
-        </ResponsiveContainer>
+        <div className="rowBetween">
+          <div className="eyebrow">{chart.title}</div>
+          {chart.ref && <div className="eyebrow">{chart.refLabel || "target"} {chart.ref}</div>}
+        </div>
+        {chart.data.length ? (
+          <ResponsiveContainer width="100%" height={200}>
+            {chart.type === "bar" ? (
+              <BarChart data={chart.data} margin={{ top: 8, right: 8, left: -14, bottom: 0 }}>
+                <CartesianGrid stroke="#26262C" strokeDasharray="3 3" />
+                <XAxis dataKey="label" tick={{ fill: "#6E6E78", fontSize: 10 }} />
+                <YAxis tick={{ fill: "#6E6E78", fontSize: 10 }} />
+                <Tooltip contentStyle={{ background: "#1A1A1F", border: "1px solid #26262C", borderRadius: 8, color: "#EDECE8" }} />
+                <Bar dataKey="v" fill={chart.color} radius={[4, 4, 0, 0]} />
+              </BarChart>
+            ) : (
+              <LineChart data={chart.data} margin={{ top: 8, right: 8, left: -18, bottom: 0 }}>
+                <CartesianGrid stroke="#26262C" strokeDasharray="3 3" />
+                <XAxis dataKey="label" tick={{ fill: "#6E6E78", fontSize: 10 }} />
+                <YAxis tick={{ fill: "#6E6E78", fontSize: 10 }} domain={chart.domain || ["auto", "auto"]} />
+                <Tooltip contentStyle={{ background: "#1A1A1F", border: "1px solid #26262C", borderRadius: 8, color: "#EDECE8" }} />
+                {chart.ref && <ReferenceLine y={chart.ref} stroke={chart.color} strokeDasharray="4 4" />}
+                <Line type="monotone" dataKey="v" stroke={chart.color} strokeWidth={2} dot={{ r: 3, fill: chart.color }} />
+              </LineChart>
+            )}
+          </ResponsiveContainer>
+        ) : (
+          <div className="empty">No data for this chart yet — it fills in as you log.</div>
+        )}
       </div>
     </div>
   );
@@ -1098,6 +1286,17 @@ function Style() {
       .histSession { padding: 8px 0; border-top: 1px solid #1E1E24; }
       .histDate { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #6E6E78; margin-bottom: 4px; }
 
+      .flagHead { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; font-weight: 700; margin: 10px 0 2px; }
+      .progTrack { height: 8px; background: #0D0D10; border: 1px solid #22222A; border-radius: 5px; overflow: hidden; }
+      .progFill { height: 100%; border-radius: 5px; transition: width 0.4s ease; }
+      .projText { font-size: 11px; color: #6E6E78; margin-top: 4px; }
+      .chartTabs { display: flex; gap: 5px; margin-bottom: 12px; flex-wrap: wrap; }
+      .chartTab {
+        flex: 1; min-width: 44px; background: #16161B; border: 1px solid #22222A; color: #6E6E78;
+        border-radius: 9px; padding: 8px 0; font-weight: 700; font-size: 11px; cursor: pointer; font-family: inherit;
+      }
+      .chartTab.active { background: #EDECE8; border-color: #EDECE8; color: #0D0D10; }
+
       .exCard { padding: 12px; }
       .exName { font-weight: 700; font-size: 15px; }
       .mainTag {
@@ -1106,6 +1305,7 @@ function Style() {
       }
       .exTarget { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #6E6E78; }
       .cue { font-size: 12px; color: #E8B93B; margin: 5px 0 3px; }
+      .autoNote { font-size: 12px; color: #3DA35D; margin: 5px 0 0; font-family: 'JetBrains Mono', monospace; }
       .setHead, .setRow { display: grid; grid-template-columns: 28px 1fr 1fr 1fr 1fr; gap: 6px; align-items: center; margin-top: 6px; }
       .setHead { color: #55555E; font-size: 10px; text-transform: uppercase; letter-spacing: 0.8px; }
       .setRow.withDoh, .setHead:has(+ .setRow.withDoh) { grid-template-columns: 28px 1fr 1fr 1fr 1fr 40px; }
