@@ -1173,7 +1173,33 @@ function Coach({ data, save }) {
                 setImportMsg("Couldn't auto-copy in this browser — tap the box above, select all, and copy manually.");
               }
             }}>Copy backup to clipboard</button>
+
+            <button className="btnPrimary" style={{ marginTop: 8, background: "#2E6FE0" }} onClick={() => {
+              // A real downloaded file survives things clipboard/localStorage don't —
+              // clearing site data, switching browsers, even losing the phone if it's
+              // synced to cloud storage. This is the one that actually matters most.
+              const json = JSON.stringify(data, null, 2);
+              const blob = new Blob([json], { type: "application/json" });
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement("a");
+              const stamp = new Date().toISOString().slice(0, 10);
+              a.href = url;
+              a.download = `bucs610-backup-${stamp}.json`;
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+              URL.revokeObjectURL(url);
+              save({ ...data, lastBackupAt: new Date().toISOString() });
+              setImportMsg("Downloaded as a real file — check your Downloads/Files app. This one survives even if site data gets cleared.");
+            }}>Download backup file (safest option)</button>
             <div className="eyebrow" style={{ margin: "12px 0 6px" }}>Restore from backup</div>
+            <input type="file" accept="application/json" className="notesInput" style={{ marginBottom: 8 }} onChange={(e) => {
+              const file = e.target.files[0];
+              if (!file) return;
+              const reader = new FileReader();
+              reader.onload = (ev) => setImportText(ev.target.result);
+              reader.readAsText(file);
+            }} />
             <textarea
               className="dataBox"
               placeholder="Paste exported JSON here…"
